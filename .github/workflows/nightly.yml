@@ -153,6 +153,8 @@ jobs:
         run: |
           if ! command -v zig >/dev/null 2>&1; then
             brew install zig
+          else
+            brew upgrade zig 2>/dev/null || true
           fi
           npm install --global "create-dmg@${CREATE_DMG_VERSION}"
 
