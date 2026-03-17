@@ -8047,6 +8047,12 @@ final class Workspace: Identifiable, ObservableObject {
 
     private func flushWorkspaceWindowLayouts() {
         for window in NSApp.windows {
+            // Skip windows that are not visible or are off-screen SwiftUI
+            // system windows (settings, about, etc.). Calling
+            // layoutSubtreeIfNeeded on those can trigger an infinite
+            // constraint-update cycle (NSGenericException) when their
+            // SwiftUI layout has not converged.
+            guard window.isVisible, window.frame.origin.y >= -2000 else { continue }
             window.contentView?.layoutSubtreeIfNeeded()
             window.contentView?.displayIfNeeded()
         }

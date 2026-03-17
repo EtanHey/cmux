@@ -705,7 +705,15 @@ final class TerminalNotificationStore: ObservableObject {
             self?.refreshDockBadge()
         }
         refreshDockBadge()
-        refreshAuthorizationStatus()
+        // Defer initial authorization check past the window constraint setup
+        // phase. When getNotificationSettings completes quickly (cached result),
+        // setting @Published authorizationState during an active Auto Layout
+        // pass triggers an infinite constraint-update cycle (NSGenericException).
+        // A real delay (not just async) is needed because the constraint pass
+        // can span multiple main-queue drain cycles.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.refreshAuthorizationStatus()
+        }
     }
 
     deinit {
@@ -763,9 +771,24 @@ final class TerminalNotificationStore: ObservableObject {
 
     func refreshAuthorizationStatus() {
         center.getNotificationSettings { [weak self] settings in
-            DispatchQueue.main.async {
+            // Use asyncAfter to ensure the @Published update lands outside
+            // any active Auto Layout constraint pass. A plain main.async can
+            // still fire during the same display cycle that triggered the
+            // settings query, causing an infinite constraint-update loop.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 guard let self else { return }
-                self.authorizationState = Self.authorizationState(from: settings.authorizationStatus)
+                let newState = Self.authorizationState(from: settings.authorizationStatus)
+                // Skip no-op updates to avoid triggering @Published / SwiftUI
+                // invalidation during Auto Layout constraint passes. When this
+                // fires during window setup the constraint-update cycle can
+                // exceed AppKit's limit and throw NSGenericException.
+                guard newState != self.authorizationState else {
+                    self.logAuthorization(
+                        "refresh status=\(Self.authorizationStatusLabel(settings.authorizationStatus)) mapped=\(newState.statusLabel) (no change)"
+                    )
+                    return
+                }
+                self.authorizationState = newState
                 self.logAuthorization(
                     "refresh status=\(Self.authorizationStatusLabel(settings.authorizationStatus)) mapped=\(self.authorizationState.statusLabel)"
                 )
