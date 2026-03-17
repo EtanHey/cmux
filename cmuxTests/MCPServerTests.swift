@@ -138,6 +138,13 @@ final class MCPHandlerTests: XCTestCase {
         executedMethod = nil
         executedParams = nil
         executorResult = .ok(["test": true])
+        // Initialize the handler so tools/list and tools/call work
+        let initReq = mcpRequest(id: 0, method: "initialize", params: [
+            "protocolVersion": "2024-11-05",
+            "capabilities": [:],
+            "clientInfo": ["name": "test", "version": "1.0"]
+        ])
+        _ = handler.handleRequest(initReq)
     }
 
     func testInitializeReturnsProtocolVersion() {
@@ -269,6 +276,16 @@ final class MCPHandlerTests: XCTestCase {
         let response = handler.handleRequest(data)!
         let error = response["error"] as! [String: Any]
         XCTAssertEqual(error["code"] as? Int, -32700)
+    }
+
+    func testToolsListBeforeInitializeReturnsError() {
+        // Fresh handler without initialize
+        let freshHandler = MCPHandler { _, _ in .ok([:]) }
+        let request = mcpRequest(id: 1, method: "tools/list", params: [:])
+        let response = freshHandler.handleRequest(request)!
+        XCTAssertNotNil(response["error"])
+        let error = response["error"] as! [String: Any]
+        XCTAssertEqual(error["code"] as? Int, -32002)
     }
 
     // MARK: - Routing Tests for All 20 Tools

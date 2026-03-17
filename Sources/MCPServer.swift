@@ -71,7 +71,11 @@ enum MCPFraming {
 
     /// Encode a dictionary as a JSON-RPC response with Content-Length framing.
     static func encodeResponse(_ dict: [String: Any]) -> Data {
-        let json = try! JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
+        guard let json = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]) else {
+            // Fallback: return a minimal JSON-RPC error that is always serializable
+            let fallback = #"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal serialization error"}}"#
+            return encode(fallback.data(using: .utf8)!)
+        }
         return encode(json)
     }
 }
@@ -117,12 +121,18 @@ final class MCPHandler {
         case "initialized":
             // Client notification — no response needed
             return nil
-        case "tools/list":
-            return handleToolsList(id: id, params: params)
-        case "tools/call":
-            return handleToolsCall(id: id, params: params)
         case "ping":
             return jsonRPCResult(id: id, result: [:])
+        case "tools/list", "tools/call":
+            // Require initialize handshake before tool operations
+            guard initialized else {
+                return jsonRPCError(id: id, code: -32002, message: "Server not initialized. Send initialize first.")
+            }
+            if method == "tools/list" {
+                return handleToolsList(id: id, params: params)
+            } else {
+                return handleToolsCall(id: id, params: params)
+            }
         default:
             return jsonRPCError(id: id, code: -32601, message: "Method not found: \(method)")
         }
@@ -388,6 +398,7 @@ enum MCPToolSchemas {
             if let s = params["surface"] { v2["surface"] = s }
             if let t = params["text"] { v2["text"] = t }
             if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let pe = params["press_enter"] { v2["press_enter"] = pe }
             return v2
         }),
         "send_key": Route(v2Method: "surface.send_key", mapParams: { params in

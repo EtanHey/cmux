@@ -1171,6 +1171,25 @@ class TerminalController {
         }
     }
 
+    /// Write binary data to a socket, handling partial writes and EINTR.
+    private func writeSocketData(_ data: Data, to socket: Int32) {
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var written = 0
+            let total = data.count
+            while written < total {
+                let result = write(socket, baseAddress.advanced(by: written), total - written)
+                if result > 0 {
+                    written += result
+                } else if result == -1 && errno == EINTR {
+                    continue
+                } else {
+                    break // write error — connection likely closed
+                }
+            }
+        }
+    }
+
     private func passwordAuthRequiredResponse(for command: String) -> String {
         let message = "Authentication required. Send auth <password> first."
         guard command.hasPrefix("{"),
@@ -1585,6 +1604,13 @@ class TerminalController {
             if !mcpDetected && mcpHandler == nil {
                 let firstBytes = Data(buffer[0..<min(bytesRead, 16)])
                 if firstBytes.starts(with: "Content-Length:".data(using: .utf8)!) {
+                    // Reject MCP connections when password auth is required.
+                    // MCP clients (socat) cannot perform the password handshake.
+                    if accessMode.requiresPasswordAuth {
+                        let errMsg = "ERROR: MCP connections not supported in password auth mode\n"
+                        errMsg.withCString { ptr in _ = write(socket, ptr, strlen(ptr)) }
+                        return
+                    }
                     mcpDetected = true
                     mcpHandler = MCPHandler { [weak self] method, params in
                         guard let self else { return .error(code: "internal", message: "Server unavailable") }
@@ -1604,20 +1630,17 @@ class TerminalController {
                         mcpBuffer = mcpBuffer.subdata(in: consumed..<mcpBuffer.count)
                         if let response = handler.handleRequest(messageData) {
                             let framed = MCPFraming.encodeResponse(response)
-                            framed.withUnsafeBytes { ptr in
-                                _ = write(socket, ptr.baseAddress!, framed.count)
-                            }
+                            writeSocketData(framed, to: socket)
                         }
+                        continue  // Try parsing next message from buffer
                     case .needMore:
                         break
                     case .notMCP:
-                        // Shouldn't happen after detection, but drop the byte and retry
-                        if !mcpBuffer.isEmpty {
-                            mcpBuffer = mcpBuffer.subdata(in: 1..<mcpBuffer.count)
-                            continue
-                        }
+                        // Corrupted data after MCP detection — close connection.
+                        mcpBuffer.removeAll()
+                        return
                     }
-                    break
+                    break  // Only reached from .needMore
                 }
             } else {
                 // V1/V2 mode: newline-delimited
@@ -2039,26 +2062,27 @@ class TerminalController {
     /// Execute a V1 plain-text command from MCP tool calls (for sidebar commands like set_status, set_progress).
     private func mcpExecuteV1(command: String, params: [String: Any]) -> MCPHandler.V2ExecutorResult {
         var args = command
-        // Build V1 argument string from params
+        // Build V1 argument string from params.
+        // Values are quoted to prevent injection via the V1 tokenizer.
         switch command {
         case "report_meta":
-            // Format: report_meta key value [--icon X] [--color #RRGGBB] [--surface S]
+            // Format: report_meta key value [--icon=X] [--color=#RRGGBB] [--surface=S]
             guard let key = params["key"] as? String, let value = params["value"] as? String else {
                 return .error(code: "invalid_params", message: "report_meta requires key and value")
             }
-            args = "report_meta \(key) \(value)"
-            if let icon = params["icon"] as? String { args += " --icon \(icon)" }
-            if let color = params["color"] as? String { args += " --color \(color)" }
-            if let surface = params["surface"] as? String { args += " --surface \(surface)" }
+            args = "report_meta \(mcpQuoteV1(key)) \(mcpQuoteV1(value))"
+            if let icon = params["icon"] as? String { args += " --icon=\(mcpQuoteV1(icon))" }
+            if let color = params["color"] as? String { args += " --color=\(mcpQuoteV1(color))" }
+            if let surface = params["surface"] as? String { args += " --surface=\(mcpQuoteV1(surface))" }
         case "set_progress":
-            // Format: set_progress value [--label TEXT] [--surface S]
+            // Format: set_progress value [--label=TEXT] [--surface=S]
             if let value = params["value"] as? Double {
                 args = "set_progress \(value)"
             } else if let value = params["value"] as? Int {
                 args = "set_progress \(value)"
             }
-            if let label = params["label"] as? String { args += " --label \(label)" }
-            if let surface = params["surface"] as? String { args += " --surface \(surface)" }
+            if let label = params["label"] as? String { args += " --label=\(mcpQuoteV1(label))" }
+            if let surface = params["surface"] as? String { args += " --surface=\(mcpQuoteV1(surface))" }
         default:
             break
         }
@@ -2068,6 +2092,15 @@ class TerminalController {
             return .error(code: "v1_error", message: responseStr)
         }
         return .ok(["response": responseStr])
+    }
+
+    /// Quote a string for safe embedding in V1 command arguments.
+    /// Wraps in double quotes and escapes internal quotes/backslashes.
+    private func mcpQuoteV1(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 
     // MARK: - V2 JSON Socket Protocol
