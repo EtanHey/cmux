@@ -1573,27 +1573,71 @@ class TerminalController {
         var buffer = [UInt8](repeating: 0, count: 4096)
         var pending = ""
         var authenticated = false
+        var mcpDetected = false
+        var mcpBuffer = Data()
+        var mcpHandler: MCPHandler?
 
         while withListenerState({ isRunning }) {
             let bytesRead = read(socket, &buffer, buffer.count - 1)
             guard bytesRead > 0 else { break }
 
-            let chunk = String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
-            pending.append(chunk)
-
-            while let newlineIndex = pending.firstIndex(of: "\n") {
-                let line = String(pending[..<newlineIndex])
-                pending = String(pending[pending.index(after: newlineIndex)...])
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
-
-                if let authResponse = authResponseIfNeeded(for: trimmed, authenticated: &authenticated) {
-                    writeSocketResponse(authResponse, to: socket)
-                    continue
+            // On first read, detect MCP Content-Length framing vs NDJSON/V1.
+            if !mcpDetected && mcpHandler == nil {
+                let firstBytes = Data(buffer[0..<min(bytesRead, 16)])
+                if firstBytes.starts(with: "Content-Length:".data(using: .utf8)!) {
+                    mcpDetected = true
+                    mcpHandler = MCPHandler { [weak self] method, params in
+                        guard let self else { return .error(code: "internal", message: "Server unavailable") }
+                        return self.mcpExecuteV2(method: method, params: params)
+                    }
                 }
+            }
 
-                let response = processCommand(trimmed)
-                writeSocketResponse(response, to: socket)
+            if mcpDetected, let handler = mcpHandler {
+                // MCP mode: Content-Length framed messages
+                mcpBuffer.append(contentsOf: buffer[0..<bytesRead])
+
+                while true {
+                    let result = MCPFraming.parse(mcpBuffer)
+                    switch result {
+                    case .message(let messageData, let consumed):
+                        mcpBuffer = mcpBuffer.subdata(in: consumed..<mcpBuffer.count)
+                        if let response = handler.handleRequest(messageData) {
+                            let framed = MCPFraming.encodeResponse(response)
+                            framed.withUnsafeBytes { ptr in
+                                _ = write(socket, ptr.baseAddress!, framed.count)
+                            }
+                        }
+                    case .needMore:
+                        break
+                    case .notMCP:
+                        // Shouldn't happen after detection, but drop the byte and retry
+                        if !mcpBuffer.isEmpty {
+                            mcpBuffer = mcpBuffer.subdata(in: 1..<mcpBuffer.count)
+                            continue
+                        }
+                    }
+                    break
+                }
+            } else {
+                // V1/V2 mode: newline-delimited
+                let chunk = String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
+                pending.append(chunk)
+
+                while let newlineIndex = pending.firstIndex(of: "\n") {
+                    let line = String(pending[..<newlineIndex])
+                    pending = String(pending[pending.index(after: newlineIndex)...])
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { continue }
+
+                    if let authResponse = authResponseIfNeeded(for: trimmed, authenticated: &authenticated) {
+                        writeSocketResponse(authResponse, to: socket)
+                        continue
+                    }
+
+                    let response = processCommand(trimmed)
+                    writeSocketResponse(response, to: socket)
+                }
             }
         }
     }
@@ -1950,6 +1994,80 @@ class TerminalController {
                 return "ERROR: Unknown command '\(cmd)'. Use 'help' for available commands."
             }
         }
+    }
+
+    // MARK: - MCP Bridge
+
+    /// Execute a V2 method from the MCP handler, bridging MCP tool calls to the V2 dispatch.
+    private func mcpExecuteV2(method: String, params: [String: Any]) -> MCPHandler.V2ExecutorResult {
+        // V1 commands (no dot in method name) are routed as plain text commands
+        if !method.contains(".") {
+            return mcpExecuteV1(command: method, params: params)
+        }
+
+        // V2: Build a synthetic JSON-RPC request
+        let requestId = UUID().uuidString
+        let request: [String: Any] = [
+            "id": requestId,
+            "method": method,
+            "params": params
+        ]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: request),
+              let jsonStr = String(data: jsonData, encoding: .utf8) else {
+            return .error(code: "internal", message: "Failed to serialize V2 request")
+        }
+
+        let responseStr = processV2Command(jsonStr)
+
+        // Parse the V2 response
+        guard let responseData = responseStr.data(using: .utf8),
+              let responseDict = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+            return .error(code: "internal", message: "Failed to parse V2 response")
+        }
+
+        if let ok = responseDict["ok"] as? Bool, ok, let result = responseDict["result"] {
+            return .ok(result)
+        } else if let error = responseDict["error"] as? [String: Any] {
+            let code = error["code"] as? String ?? "unknown"
+            let message = error["message"] as? String ?? "Unknown error"
+            return .error(code: code, message: message)
+        }
+
+        return .error(code: "internal", message: "Unexpected V2 response format")
+    }
+
+    /// Execute a V1 plain-text command from MCP tool calls (for sidebar commands like set_status, set_progress).
+    private func mcpExecuteV1(command: String, params: [String: Any]) -> MCPHandler.V2ExecutorResult {
+        var args = command
+        // Build V1 argument string from params
+        switch command {
+        case "report_meta":
+            // Format: report_meta key value [--icon X] [--color #RRGGBB] [--surface S]
+            guard let key = params["key"] as? String, let value = params["value"] as? String else {
+                return .error(code: "invalid_params", message: "report_meta requires key and value")
+            }
+            args = "report_meta \(key) \(value)"
+            if let icon = params["icon"] as? String { args += " --icon \(icon)" }
+            if let color = params["color"] as? String { args += " --color \(color)" }
+            if let surface = params["surface"] as? String { args += " --surface \(surface)" }
+        case "set_progress":
+            // Format: set_progress value [--label TEXT] [--surface S]
+            if let value = params["value"] as? Double {
+                args = "set_progress \(value)"
+            } else if let value = params["value"] as? Int {
+                args = "set_progress \(value)"
+            }
+            if let label = params["label"] as? String { args += " --label \(label)" }
+            if let surface = params["surface"] as? String { args += " --surface \(surface)" }
+        default:
+            break
+        }
+
+        let responseStr = processCommand(args)
+        if responseStr.hasPrefix("ERROR") || responseStr.hasPrefix("error") {
+            return .error(code: "v1_error", message: responseStr)
+        }
+        return .ok(["response": responseStr])
     }
 
     // MARK: - V2 JSON Socket Protocol
