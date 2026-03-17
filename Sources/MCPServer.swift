@@ -382,38 +382,38 @@ enum MCPToolSchemas {
     private static let routes: [String: Route] = [
         "list_surfaces": Route(v2Method: "surface.list", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "read_screen": Route(v2Method: "surface.read_text", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
+            if let s = params["surface"] { v2["surface_id"] = s }
             if let l = params["lines"] { v2["lines"] = l }
             if let sb = params["scrollback"] { v2["scrollback"] = sb }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "send_input": Route(v2Method: "surface.send_text", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
+            if let s = params["surface"] { v2["surface_id"] = s }
             if let t = params["text"] { v2["text"] = t }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             if let pe = params["press_enter"] { v2["press_enter"] = pe }
             return v2
         }),
         "send_key": Route(v2Method: "surface.send_key", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
+            if let s = params["surface"] { v2["surface_id"] = s }
             if let k = params["key"] { v2["key"] = k }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "new_split": Route(v2Method: "surface.split", mapParams: { params in
             var v2: [String: Any] = [:]
             if let d = params["direction"] { v2["direction"] = d }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
-            if let s = params["surface"] { v2["surface"] = s }
-            if let p = params["pane"] { v2["pane"] = p }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
+            if let s = params["surface"] { v2["surface_id"] = s }
+            if let p = params["pane"] { v2["pane_id"] = p }
             if let t = params["type"] { v2["type"] = t }
             if let u = params["url"] { v2["url"] = u }
             if let ti = params["title"] { v2["title"] = ti }
@@ -422,8 +422,8 @@ enum MCPToolSchemas {
         }),
         "close_surface": Route(v2Method: "surface.close", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let s = params["surface"] { v2["surface_id"] = s }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "set_status": Route(v2Method: "report_meta", mapParams: { params in
@@ -436,10 +436,10 @@ enum MCPToolSchemas {
         }),
         "rename_tab": Route(v2Method: "surface.action", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
+            if let s = params["surface"] { v2["surface_id"] = s }
             if let t = params["title"] { v2["title"] = t }
             v2["action"] = "rename"
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "list_workspaces": Route(v2Method: "workspace.list", mapParams: { _ in [:] }),
@@ -451,18 +451,18 @@ enum MCPToolSchemas {
         }),
         "select_workspace": Route(v2Method: "workspace.select", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "list_panes": Route(v2Method: "pane.list", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "focus_pane": Route(v2Method: "pane.focus", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let p = params["pane"] { v2["pane"] = p }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let p = params["pane"] { v2["pane_id"] = p }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "system_identify": Route(v2Method: "system.identify", mapParams: { _ in [:] }),
@@ -471,26 +471,28 @@ enum MCPToolSchemas {
             var v2: [String: Any] = [:]
             if let t = params["title"] { v2["title"] = t }
             if let b = params["body"] { v2["body"] = b }
-            if let s = params["surface"] { v2["surface"] = s }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let s = params["surface"] { v2["surface_id"] = s }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             return v2
         }),
         "browser_open": Route(v2Method: "browser.open_split", mapParams: { params in
             var v2: [String: Any] = [:]
             if let u = params["url"] { v2["url"] = u }
-            if let ws = params["workspace"] { v2["workspace"] = ws }
+            if let ws = params["workspace"] { v2["workspace_id"] = ws }
             if let d = params["direction"] { v2["direction"] = d }
             return v2
         }),
         "browser_navigate": Route(v2Method: "browser.navigate", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
+            // V2 browser.navigate expects surface_id, not surface
+            if let s = params["surface"] { v2["surface_id"] = s }
             if let u = params["url"] { v2["url"] = u }
             return v2
         }),
         "browser_snapshot": Route(v2Method: "browser.snapshot", mapParams: { params in
             var v2: [String: Any] = [:]
-            if let s = params["surface"] { v2["surface"] = s }
+            // V2 browser.snapshot uses v2BrowserWithPanel which expects surface_id
+            if let s = params["surface"] { v2["surface_id"] = s }
             return v2
         }),
     ]
