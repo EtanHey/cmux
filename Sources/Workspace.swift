@@ -8045,6 +8045,11 @@ final class Workspace: Identifiable, ObservableObject {
         layoutFollowUpNeedsGeometryPass = false
     }
 
+    /// Windows positioned below this Y coordinate are treated as off-screen
+    /// SwiftUI system windows (settings, about, etc.) and skipped during layout
+    /// flushes to avoid triggering Auto Layout constraint cycles.
+    private static let offscreenLayoutSkipYThreshold: CGFloat = -2000
+
     private func flushWorkspaceWindowLayouts() {
         for window in NSApp.windows {
             // Skip windows that are not visible or are off-screen SwiftUI
@@ -8052,7 +8057,7 @@ final class Workspace: Identifiable, ObservableObject {
             // layoutSubtreeIfNeeded on those can trigger an infinite
             // constraint-update cycle (NSGenericException) when their
             // SwiftUI layout has not converged.
-            guard window.isVisible, window.frame.origin.y >= -2000 else { continue }
+            guard window.isVisible, window.frame.origin.y >= Self.offscreenLayoutSkipYThreshold else { continue }
             window.contentView?.layoutSubtreeIfNeeded()
             window.contentView?.displayIfNeeded()
         }
