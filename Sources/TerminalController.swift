@@ -13687,17 +13687,27 @@ class TerminalController {
         reportArgs: String,
         options: [String: String]
     ) -> (tabId: UUID?, error: String?) {
-        var tabId: UUID?
+        // Off-main fast-path: honor explicit --tab UUID without touching the main thread.
+        // High-frequency agent/shell flows typically provide explicit IDs.
+        if let rawTab = options["tab"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawTab.isEmpty {
+            guard let explicitId = UUID(uuidString: rawTab) else {
+                return (nil, "ERROR: Invalid tab id '\(rawTab)'")
+            }
+            return (explicitId, nil)
+        }
+
+        // Fallback: resolve the currently-selected tab on main as a short, bounded hop.
+        var selectedId: UUID?
         DispatchQueue.main.sync {
             if let tab = resolveTabForReport(reportArgs) {
-                tabId = tab.id
+                selectedId = tab.id
             }
         }
-        if let tabId {
-            return (tabId, nil)
+        if let selectedId {
+            return (selectedId, nil)
         }
-        let error = options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
-        return (nil, error)
+        return (nil, "ERROR: No tab selected")
     }
 
     private func tabForSidebarMutation(id: UUID) -> Tab? {
@@ -14356,46 +14366,21 @@ class TerminalController {
             }
             ports.append(port)
         }
+        let normalizedPorts = Array(Set(ports)).sorted()
 
-        var result = "OK"
-        DispatchQueue.main.sync {
-            guard let tab = resolveTabForReport(args) else {
-                result = parsed.options["tab"] != nil ? "ERROR: Tab not found" : "ERROR: No tab selected"
+        // Use the shared helper to parse/resolve off-main and schedule mutation async,
+        // avoiding main thread starvation from synchronous socket telemetry (see #1550).
+        return schedulePanelMetadataMutation(
+            args: args,
+            options: parsed.options,
+            missingPanelUsage: "report_ports <port1> [port2...] [--tab=X] [--panel=Y]"
+        ) { tab, surfaceId in
+            guard Self.shouldReplacePorts(current: tab.surfaceListeningPorts[surfaceId], next: normalizedPorts) else {
                 return
             }
-
-            let validSurfaceIds = Set(tab.panels.keys)
-            tab.pruneSurfaceMetadata(validSurfaceIds: validSurfaceIds)
-
-            let panelArg = parsed.options["panel"] ?? parsed.options["surface"]
-            let surfaceId: UUID
-            if let panelArg {
-                if panelArg.isEmpty {
-                    result = "ERROR: Missing panel id — usage: report_ports <port1> [port2...] [--tab=X] [--panel=Y]"
-                    return
-                }
-                guard let parsedId = UUID(uuidString: panelArg) else {
-                    result = "ERROR: Invalid panel id '\(panelArg)'"
-                    return
-                }
-                surfaceId = parsedId
-            } else {
-                guard let focused = tab.focusedPanelId else {
-                    result = "ERROR: Missing panel id (no focused surface)"
-                    return
-                }
-                surfaceId = focused
-            }
-
-            guard validSurfaceIds.contains(surfaceId) else {
-                result = "ERROR: Panel not found '\(surfaceId.uuidString)'"
-                return
-            }
-
-            tab.surfaceListeningPorts[surfaceId] = ports
+            tab.surfaceListeningPorts[surfaceId] = normalizedPorts
             tab.recomputeListeningPorts()
         }
-        return result
     }
 
     private func reportPwd(_ args: String) -> String {
