@@ -292,6 +292,52 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(portsKickResult["surface_id"] as? String, focusedPanelId.uuidString)
     }
 
+    func testSurfaceTelemetryQueuesTTYAndPortKickTogether() async throws {
+        let socketPath = makeSocketPath("telemetry")
+        let manager = TabManager()
+        let workspace = manager.addWorkspace(select: true)
+
+        defer {
+            if manager.tabs.contains(where: { $0.id == workspace.id }) {
+                manager.closeWorkspace(workspace)
+            }
+        }
+
+        guard let focusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with a focused panel")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try await sendV2RequestAsync(
+            method: "surface.telemetry",
+            params: [
+                "workspace_id": workspace.id.uuidString,
+                "tty_name": "ttys123",
+                "reason": "command",
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertEqual(result["queued"] as? Bool, true)
+        XCTAssertNil(result["surface_id"] as? String)
+
+        let deadline = Date().addingTimeInterval(2.0)
+        while workspace.surfaceTTYNames[focusedPanelId] != "ttys123", Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+
+        XCTAssertEqual(workspace.surfaceTTYNames[focusedPanelId], "ttys123")
+    }
+
     func testSurfaceRelayRPCsRejectExplicitUnknownSurfaceID() async throws {
         let socketPath = makeSocketPath("relay-invalid")
         let manager = TabManager()
