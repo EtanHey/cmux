@@ -3271,7 +3271,7 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
         )
 
         XCTAssertTrue(
-            output.contains(#"rpc surface.ports_kick {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"refresh"}"#),
+            output.contains(#"__hot-path rpc surface.telemetry {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"refresh"}"#),
             output
         )
         XCTAssertFalse(output.contains("surface_id"), output)
@@ -3320,7 +3320,7 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
         )
 
         XCTAssertTrue(
-            output.contains(#"rpc surface.ports_kick {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"refresh","surface_id":"22222222-2222-2222-2222-222222222222"}"#),
+            output.contains(#"__hot-path rpc surface.telemetry {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"refresh","surface_id":"22222222-2222-2222-2222-222222222222"}"#),
             output
         )
     }
@@ -3409,11 +3409,7 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
         )
 
         XCTAssertTrue(
-            result.stdout.contains(#"rpc surface.report_tty {"workspace_id":"11111111-1111-1111-1111-111111111111","tty_name":"ttys889"}"#),
-            result.stdout
-        )
-        XCTAssertTrue(
-            result.stdout.contains(#"rpc surface.ports_kick {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"command"}"#),
+            result.stdout.contains(#"__hot-path rpc surface.telemetry {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"command","tty_name":"ttys889"}"#),
             result.stdout
         )
         XCTAssertFalse(result.stdout.contains(#""surface_id""#), result.stdout)
@@ -3462,7 +3458,7 @@ final class ZshShellIntegrationHandoffTests: XCTestCase {
 
         XCTAssertFalse(result.stderr.contains("_cmux_report_tmux_state"), result.stderr)
         XCTAssertTrue(
-            result.stdout.contains(#"rpc surface.ports_kick {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"refresh","surface_id":"22222222-2222-2222-2222-222222222222"}"#),
+            result.stdout.contains(#"__hot-path rpc surface.telemetry {"workspace_id":"11111111-1111-1111-1111-111111111111","reason":"refresh","surface_id":"22222222-2222-2222-2222-222222222222"}"#),
             result.stdout
         )
     }

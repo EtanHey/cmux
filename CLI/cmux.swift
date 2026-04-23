@@ -879,6 +879,7 @@ final class SocketClient {
     }
 
     private let path: String
+    private let keepRelayConnectionOpen: Bool
     private var socketFD: Int32 = -1
     private static let defaultResponseTimeoutSeconds: TimeInterval = 15.0
     private static let multilineResponseIdleTimeoutSeconds: TimeInterval = 0.12
@@ -894,8 +895,9 @@ final class SocketClient {
         return defaultResponseTimeoutSeconds
     }()
 
-    init(path: String) {
+    init(path: String, keepRelayConnectionOpen: Bool = false) {
         self.path = path
+        self.keepRelayConnectionOpen = keepRelayConnectionOpen
     }
 
     var socketPath: String {
@@ -945,7 +947,7 @@ final class SocketClient {
             try connect()
         }
         guard socketFD >= 0 else { throw CLIError(message: "Not connected") }
-        let shouldCloseAfterSend = relayEndpoint != nil
+        let shouldCloseAfterSend = relayEndpoint != nil && !keepRelayConnectionOpen
         defer {
             if shouldCloseAfterSend {
                 close()
@@ -1634,6 +1636,515 @@ struct CMUXCLI {
 #endif
     }
 
+    private static let hotPathBrokerIdleTimeoutSeconds: TimeInterval = 180
+
+    private func hotPathEnvironmentSnapshot(from environment: [String: String]) -> [String: String] {
+        let prefixes = [
+            "CMUX_",
+            "CODEX_",
+            "CLAUDE_",
+            "OPENCODE_",
+            "ANTHROPIC_",
+        ]
+        let exactKeys: Set<String> = [
+            "HOME",
+            "NODE_OPTIONS",
+            "PATH",
+            "PWD",
+            "SSH_TTY",
+            "TERM",
+            "TMUX",
+            "TMUX_PANE",
+            "TTY",
+        ]
+
+        var snapshot: [String: String] = [:]
+        for (key, value) in environment {
+            if exactKeys.contains(key) || prefixes.contains(where: { key.hasPrefix($0) }) {
+                snapshot[key] = value
+            }
+        }
+        return snapshot
+    }
+
+    private func defaultHotPathBrokerSocketPath(targetSocketPath: String) -> String {
+        let digest = SHA256.hash(data: Data(targetSocketPath.utf8))
+        let prefix = digest.prefix(10).map { String(format: "%02x", $0) }.joined()
+        return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("cmux-hot-path-\(prefix).sock", isDirectory: false)
+            .path
+    }
+
+    private func hotPathBrokerLockPath(for brokerSocketPath: String) -> String {
+        brokerSocketPath + ".lock"
+    }
+
+    private static let hotPathEnvironmentThreadKey = "com.cmux.hot-path.environment"
+    private static let hotPathRequestMaxBytes = 1_048_576
+
+    private func currentProcessEnvironment() -> [String: String] {
+        let environment = ProcessInfo.processInfo.environment
+        if let override = Thread.current.threadDictionary[Self.hotPathEnvironmentThreadKey] as? [String: String] {
+            return environment.merging(override, uniquingKeysWith: { _, new in new })
+        }
+        return environment
+    }
+
+    private func withHotPathEnvironment<T>(
+        _ snapshot: [String: String],
+        body: () throws -> T
+    ) throws -> T {
+        let threadDictionary = Thread.current.threadDictionary
+        let priorOverride = threadDictionary[Self.hotPathEnvironmentThreadKey]
+        threadDictionary[Self.hotPathEnvironmentThreadKey] = snapshot
+        defer {
+            if let priorOverride {
+                threadDictionary[Self.hotPathEnvironmentThreadKey] = priorOverride
+            } else {
+                threadDictionary.removeObject(forKey: Self.hotPathEnvironmentThreadKey)
+            }
+        }
+        return try body()
+    }
+
+    private func capturePrintedOutput(_ body: () throws -> Void) throws -> String {
+        let pipe = Pipe()
+        let writeFD = pipe.fileHandleForWriting.fileDescriptor
+        let savedStdout = dup(STDOUT_FILENO)
+        guard savedStdout >= 0 else {
+            throw CLIError(message: "Failed to duplicate stdout for hot-path capture")
+        }
+
+        fflush(stdout)
+        guard dup2(writeFD, STDOUT_FILENO) >= 0 else {
+            Darwin.close(savedStdout)
+            throw CLIError(message: "Failed to redirect stdout for hot-path capture")
+        }
+
+        defer {
+            fflush(stdout)
+            _ = dup2(savedStdout, STDOUT_FILENO)
+            Darwin.close(savedStdout)
+        }
+
+        try body()
+        fflush(stdout)
+        try pipe.fileHandleForWriting.close()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func parseHotPathEnv(_ request: [String: Any]) -> [String: String] {
+        let raw = request["env"] as? [String: Any] ?? [:]
+        var result: [String: String] = [:]
+        for (key, value) in raw {
+            if let string = value as? String {
+                result[key] = string
+            }
+        }
+        return result
+    }
+
+    private func parseHotPathRequestLine(_ line: String) throws -> [String: Any] {
+        guard let data = line.data(using: .utf8) else {
+            throw CLIError(message: "Invalid hot-path request encoding")
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw CLIError(message: "Invalid hot-path request JSON")
+        }
+        return object
+    }
+
+    private func hotPathRequestLine(_ object: [String: Any]) throws -> String {
+        guard JSONSerialization.isValidJSONObject(object) else {
+            throw CLIError(message: "Invalid hot-path request payload")
+        }
+        let data = try JSONSerialization.data(withJSONObject: object, options: [])
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw CLIError(message: "Failed to encode hot-path request")
+        }
+        return line
+    }
+
+    private func hotPathConnectable(_ brokerSocketPath: String) -> Bool {
+        let client = SocketClient(path: brokerSocketPath)
+        do {
+            try client.connect()
+            client.close()
+            return true
+        } catch {
+            client.close()
+            return false
+        }
+    }
+
+    private func ensureHotPathBroker(
+        brokerSocketPath: String,
+        targetSocketPath: String,
+        explicitPassword: String?
+    ) throws {
+        if hotPathConnectable(brokerSocketPath) {
+            return
+        }
+
+        let lockPath = hotPathBrokerLockPath(for: brokerSocketPath)
+        let lockFD = open(lockPath, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
+        guard lockFD >= 0 else {
+            throw CLIError(message: "Failed to open hot-path broker lock at \(lockPath)")
+        }
+        defer { Darwin.close(lockFD) }
+        guard flock(lockFD, LOCK_EX) == 0 else {
+            throw CLIError(message: "Failed to lock hot-path broker at \(lockPath)")
+        }
+        defer { _ = flock(lockFD, LOCK_UN) }
+
+        if hotPathConnectable(brokerSocketPath) {
+            return
+        }
+
+        let brokerDirectory = URL(fileURLWithPath: brokerSocketPath).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: brokerDirectory, withIntermediateDirectories: true)
+
+        guard let executablePath = resolvedExecutableURL()?.path ?? currentExecutablePath() else {
+            throw CLIError(message: "Unable to resolve cmux executable for hot-path broker")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = [
+            "--socket", targetSocketPath,
+            "__hot-path-broker",
+            "--broker-socket", brokerSocketPath,
+        ]
+        if let explicitPassword,
+           !explicitPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            process.arguments?.append(contentsOf: ["--password", explicitPassword])
+        }
+        process.environment = ProcessInfo.processInfo.environment
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+
+        let brokerClient = try SocketClient.waitForConnectableSocket(path: brokerSocketPath, timeout: 5.0)
+        brokerClient.close()
+    }
+
+    private func runHotPath(
+        commandArgs: [String],
+        socketPath: String,
+        explicitPassword: String?
+    ) throws {
+        let (explicitBrokerSocket, remaining) = parseOption(commandArgs, name: "--broker-socket")
+        let brokerSocketPath: String = {
+            if let explicit = explicitBrokerSocket {
+                return explicit
+            }
+            if let envOverride = ProcessInfo.processInfo.environment["CMUX_HOT_PATH_BROKER_SOCKET"],
+               !envOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return envOverride
+            }
+            return defaultHotPathBrokerSocketPath(targetSocketPath: socketPath)
+        }()
+        guard let mode = remaining.first?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !mode.isEmpty else {
+            throw CLIError(message: "Usage: cmux __hot-path [--broker-socket PATH] <rpc|tmux|hook> ...")
+        }
+
+        let requestEnv = hotPathEnvironmentSnapshot(from: ProcessInfo.processInfo.environment)
+        var request: [String: Any] = [
+            "mode": mode,
+            "env": requestEnv,
+        ]
+
+        switch mode {
+        case "rpc":
+            guard remaining.count >= 2 else {
+                throw CLIError(message: "Usage: cmux __hot-path rpc <method> [json-params]")
+            }
+            request["method"] = remaining[1]
+            request["params"] = try parseRPCParams(Array(remaining.dropFirst(2)))
+
+        case "tmux":
+            let tmuxArgs = Array(remaining.dropFirst())
+            guard !tmuxArgs.isEmpty else {
+                throw CLIError(message: "Usage: cmux __hot-path tmux <command> [args]")
+            }
+            request["command_args"] = tmuxArgs
+
+        case "hook":
+            guard remaining.count >= 3 else {
+                throw CLIError(message: "Usage: cmux __hot-path hook <agent> <subcommand> [args]")
+            }
+            request["agent"] = remaining[1]
+            request["command_args"] = Array(remaining.dropFirst(2))
+            request["raw_input"] = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+        default:
+            throw CLIError(message: "Unsupported hot-path mode: \(mode)")
+        }
+
+        try ensureHotPathBroker(
+            brokerSocketPath: brokerSocketPath,
+            targetSocketPath: socketPath,
+            explicitPassword: explicitPassword
+        )
+
+        let brokerClient = SocketClient(path: brokerSocketPath)
+        defer { brokerClient.close() }
+        try brokerClient.connect()
+        let rawResponse = try brokerClient.send(command: try hotPathRequestLine(request))
+        let response = try parseHotPathRequestLine(rawResponse)
+        if let ok = response["ok"] as? Bool, ok {
+            let stdout = response["stdout"] as? String ?? ""
+            if !stdout.isEmpty {
+                print(stdout, terminator: "")
+            }
+            return
+        }
+        let message = response["error"] as? String ?? "Hot-path request failed"
+        throw CLIError(message: message)
+    }
+
+    private func runHotPathBroker(
+        commandArgs: [String],
+        socketPath: String,
+        explicitPassword: String?
+    ) throws {
+        guard let brokerSocketPath = optionValue(commandArgs, name: "--broker-socket"),
+              !brokerSocketPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError(message: "Usage: cmux __hot-path-broker --broker-socket PATH")
+        }
+
+        let brokerURL = URL(fileURLWithPath: brokerSocketPath)
+        try FileManager.default.createDirectory(at: brokerURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: brokerSocketPath) {
+            try? FileManager.default.removeItem(atPath: brokerSocketPath)
+        }
+
+        let listenerFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard listenerFD >= 0 else {
+            throw CLIError(message: "Failed to create hot-path broker socket")
+        }
+        defer {
+            Darwin.close(listenerFD)
+            try? FileManager.default.removeItem(atPath: brokerSocketPath)
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(brokerSocketPath.utf8)
+        let maxPathLen = MemoryLayout.size(ofValue: addr.sun_path)
+        guard pathBytes.count < maxPathLen else {
+            throw CLIError(message: "Hot-path broker socket path is too long")
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
+            let cPath = UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self)
+            cPath.initialize(repeating: 0, count: maxPathLen)
+            for (index, byte) in pathBytes.enumerated() {
+                cPath[index] = CChar(bitPattern: byte)
+            }
+        }
+
+        let addrLen = socklen_t(MemoryLayout<sa_family_t>.size + pathBytes.count + 1)
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                Darwin.bind(listenerFD, sockaddrPtr, addrLen)
+            }
+        }
+        guard bindResult == 0 else {
+            throw CLIError(message: "Failed to bind hot-path broker socket")
+        }
+        guard listen(listenerFD, 128) == 0 else {
+            throw CLIError(message: "Failed to listen on hot-path broker socket")
+        }
+        chmod(brokerSocketPath, mode_t(S_IRUSR | S_IWUSR))
+
+        let workerQueue = DispatchQueue(label: "com.cmux.hot-path-broker.worker")
+        var sharedClient: SocketClient?
+        var lastActivity = Date()
+
+        func withHotClient<T>(_ body: (SocketClient) throws -> T) throws -> T {
+            if sharedClient == nil {
+                let client = SocketClient(path: socketPath, keepRelayConnectionOpen: true)
+                try client.connect()
+                try authenticateClientIfNeeded(
+                    client,
+                    explicitPassword: explicitPassword,
+                    socketPath: socketPath
+                )
+                sharedClient = client
+            }
+            do {
+                return try body(sharedClient!)
+            } catch {
+                sharedClient?.close()
+                sharedClient = nil
+                throw error
+            }
+        }
+
+        func performWorkerSync<T>(_ body: @escaping () throws -> T) throws -> T {
+            var result: Result<T, Error>!
+            workerQueue.sync {
+                result = Result { try body() }
+            }
+            return try result.get()
+        }
+
+        func handleRequest(_ request: [String: Any]) throws -> [String: Any] {
+            let requestEnv = parseHotPathEnv(request)
+            let mode = (request["mode"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            switch mode {
+            case "rpc":
+                let method = (request["method"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let params = request["params"] as? [String: Any] ?? [:]
+                if method == "surface.telemetry" {
+                    workerQueue.async {
+                        do {
+                            try self.withHotPathEnvironment(requestEnv) {
+                                _ = try withHotClient { client in
+                                    try client.sendV2(method: method, params: params)
+                                }
+                            }
+                        } catch {}
+                    }
+                    return ["ok": true, "stdout": ""]
+                }
+                let payload = try performWorkerSync {
+                    try self.withHotPathEnvironment(requestEnv) {
+                        try withHotClient { client in
+                            try client.sendV2(method: method, params: params)
+                        }
+                    }
+                }
+                return ["ok": true, "stdout": jsonString(payload)]
+
+            case "tmux":
+                let forwardedArgs = request["command_args"] as? [String] ?? []
+                let output = try performWorkerSync {
+                    try self.withHotPathEnvironment(requestEnv) {
+                        try self.capturePrintedOutput {
+                            try withHotClient { client in
+                                try self.runTmuxCompatCommand(
+                                    command: forwardedArgs.first ?? "",
+                                    commandArgs: Array(forwardedArgs.dropFirst()),
+                                    client: client,
+                                    jsonOutput: false,
+                                    idFormat: .refs,
+                                    windowOverride: nil
+                                )
+                            }
+                        }
+                    }
+                }
+                return ["ok": true, "stdout": output]
+
+            case "hook":
+                let agentName = (request["agent"] as? String ?? "").lowercased()
+                let forwardedArgs = request["command_args"] as? [String] ?? []
+                let rawInput = request["raw_input"] as? String ?? ""
+                let output = try performWorkerSync {
+                    try self.withHotPathEnvironment(requestEnv) {
+                        try self.capturePrintedOutput {
+                            let telemetry = CLISocketSentryTelemetry(
+                                command: "__hot-path-hook",
+                                commandArgs: [agentName] + forwardedArgs,
+                                socketPath: socketPath,
+                                processEnv: requestEnv
+                            )
+                            try withHotClient { client in
+                                if agentName == "claude" {
+                                    try self.runClaudeHook(
+                                        commandArgs: forwardedArgs,
+                                        client: client,
+                                        telemetry: telemetry,
+                                        rawInput: rawInput,
+                                        processEnv: requestEnv
+                                    )
+                                } else {
+                                    guard let def = Self.agentDef(named: agentName) else {
+                                        throw CLIError(message: "Unknown hot-path hook agent: \(agentName)")
+                                    }
+                                    try self.runGenericAgentHook(
+                                        def: def,
+                                        commandArgs: forwardedArgs,
+                                        client: client,
+                                        telemetry: telemetry,
+                                        rawInput: rawInput,
+                                        processEnv: requestEnv
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                return ["ok": true, "stdout": output]
+
+            default:
+                throw CLIError(message: "Unsupported hot-path mode: \(mode)")
+            }
+        }
+
+        while true {
+            var pollFD = pollfd(fd: listenerFD, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&pollFD, 1, 1000)
+            if ready < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw CLIError(message: "Hot-path broker poll failed")
+            }
+            if ready == 0 {
+                if Date().timeIntervalSince(lastActivity) >= Self.hotPathBrokerIdleTimeoutSeconds {
+                    sharedClient?.close()
+                    return
+                }
+                continue
+            }
+
+            let clientFD = accept(listenerFD, nil, nil)
+            if clientFD < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                continue
+            }
+            lastActivity = Date()
+
+            do {
+                var data = Data()
+                var buffer = [UInt8](repeating: 0, count: 1)
+                while true {
+                    let count = Darwin.read(clientFD, &buffer, 1)
+                    if count <= 0 { break }
+                    if buffer[0] == 0x0A { break }
+                    data.append(buffer, count: count)
+                    if data.count > Self.hotPathRequestMaxBytes {
+                        throw CLIError(message: "Hot-path broker request exceeded \(Self.hotPathRequestMaxBytes) bytes")
+                    }
+                }
+                guard let line = String(data: data, encoding: .utf8), !line.isEmpty else {
+                    Darwin.close(clientFD)
+                    continue
+                }
+                let request = try parseHotPathRequestLine(line)
+                let response = try handleRequest(request)
+                let responseLine = try hotPathRequestLine(response) + "\n"
+                _ = responseLine.withCString { ptr in
+                    Darwin.write(clientFD, ptr, strlen(ptr))
+                }
+            } catch {
+                let response: [String: Any] = ["ok": false, "error": String(describing: error)]
+                let responseLine = ((try? hotPathRequestLine(response)) ?? #"{"ok":false,"error":"Hot-path broker failure"}"#) + "\n"
+                _ = responseLine.withCString { ptr in
+                    Darwin.write(clientFD, ptr, strlen(ptr))
+                }
+            }
+            Darwin.close(clientFD)
+        }
+    }
+
     func run() throws {
         let processEnv = ProcessInfo.processInfo.environment
         let envSocketPath: String? = {
@@ -1736,6 +2247,24 @@ struct CMUXCLI {
 
         if command == "remote-daemon-status" {
             try runRemoteDaemonStatus(commandArgs: commandArgs, jsonOutput: jsonOutput)
+            return
+        }
+
+        if command == "__hot-path" {
+            try runHotPath(
+                commandArgs: commandArgs,
+                socketPath: resolvedSocketPath,
+                explicitPassword: socketPasswordArg
+            )
+            return
+        }
+
+        if command == "__hot-path-broker" {
+            try runHotPathBroker(
+                commandArgs: commandArgs,
+                socketPath: resolvedSocketPath,
+                explicitPassword: socketPasswordArg
+            )
             return
         }
 
@@ -4722,15 +5251,12 @@ struct CMUXCLI {
                 "  cmux_relay_cli=\"$HOME/.cmux/bin/cmux\"",
                 "  if [ ! -x \"$cmux_relay_cli\" ]; then cmux_relay_cli=\"$(command -v cmux 2>/dev/null || true)\"; fi",
                 "  if [ -n \"$cmux_relay_cli\" ]; then",
-                "    cmux_relay_report_tty='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"tty_name\":\"'$cmux_bootstrap_tty'\"}'",
-                "    cmux_relay_ports_kick='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"reason\":\"command\"}'",
+                "    cmux_relay_telemetry='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"tty_name\":\"'$cmux_bootstrap_tty'\",\"reason\":\"command\"}'",
                 "    if [ -n \"__CMUX_SURFACE_ID__\" ]; then",
-                "      cmux_relay_report_tty='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"surface_id\":\"__CMUX_SURFACE_ID__\",\"tty_name\":\"'$cmux_bootstrap_tty'\"}'",
-                "      cmux_relay_ports_kick='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"surface_id\":\"__CMUX_SURFACE_ID__\",\"reason\":\"command\"}'",
+                "      cmux_relay_telemetry='{\"workspace_id\":\"__CMUX_WORKSPACE_ID__\",\"surface_id\":\"__CMUX_SURFACE_ID__\",\"tty_name\":\"'$cmux_bootstrap_tty'\",\"reason\":\"command\"}'",
                 "    fi",
-                "    CMUX_SOCKET_PATH=\"127.0.0.1:\(remoteRelayPort)\" CMUX_SOCKET=\"127.0.0.1:\(remoteRelayPort)\" \"$cmux_relay_cli\" rpc surface.report_tty \"$cmux_relay_report_tty\" >/dev/null 2>&1 || true",
-                "    CMUX_SOCKET_PATH=\"127.0.0.1:\(remoteRelayPort)\" CMUX_SOCKET=\"127.0.0.1:\(remoteRelayPort)\" \"$cmux_relay_cli\" rpc surface.ports_kick \"$cmux_relay_ports_kick\" >/dev/null 2>&1 || true",
-                "    unset cmux_relay_cli cmux_relay_report_tty cmux_relay_ports_kick",
+                "    CMUX_SOCKET_PATH=\"127.0.0.1:\(remoteRelayPort)\" CMUX_SOCKET=\"127.0.0.1:\(remoteRelayPort)\" \"$cmux_relay_cli\" __hot-path rpc surface.telemetry \"$cmux_relay_telemetry\" >/dev/null 2>&1 || true",
+                "    unset cmux_relay_cli cmux_relay_telemetry",
                 "  fi",
             ]
         }
@@ -5006,16 +5532,13 @@ struct CMUXCLI {
             "  printf '%s' \"$cmux_relay_tty\" > \"$HOME/.cmux/relay/\(remoteRelayPort).tty\" 2>/dev/null || true",
             "fi",
             "if [ -n \"$cmux_relay_cli\" ] && [ -n \"$CMUX_WORKSPACE_ID\" ] && [ -n \"$cmux_relay_tty\" ] && [ \"$cmux_relay_tty\" != \"not a tty\" ]; then",
-            "  cmux_relay_report_tty=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"tty_name\\\":\\\"$cmux_relay_tty\\\"}\"",
-            "  cmux_relay_ports_kick=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"reason\\\":\\\"command\\\"}\"",
+            "  cmux_relay_telemetry=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"tty_name\\\":\\\"$cmux_relay_tty\\\",\\\"reason\\\":\\\"command\\\"}\"",
             "  if [ -n \"$CMUX_SURFACE_ID\" ]; then",
-            "    cmux_relay_report_tty=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"surface_id\\\":\\\"$CMUX_SURFACE_ID\\\",\\\"tty_name\\\":\\\"$cmux_relay_tty\\\"}\"",
-            "    cmux_relay_ports_kick=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"surface_id\\\":\\\"$CMUX_SURFACE_ID\\\",\\\"reason\\\":\\\"command\\\"}\"",
+            "    cmux_relay_telemetry=\"{\\\"workspace_id\\\":\\\"$CMUX_WORKSPACE_ID\\\",\\\"surface_id\\\":\\\"$CMUX_SURFACE_ID\\\",\\\"tty_name\\\":\\\"$cmux_relay_tty\\\",\\\"reason\\\":\\\"command\\\"}\"",
             "  fi",
-            "  \"$cmux_relay_cli\" rpc surface.report_tty \"$cmux_relay_report_tty\" >/dev/null 2>&1 || true",
-            "  \"$cmux_relay_cli\" rpc surface.ports_kick \"$cmux_relay_ports_kick\" >/dev/null 2>&1 || true",
+            "  \"$cmux_relay_cli\" __hot-path rpc surface.telemetry \"$cmux_relay_telemetry\" >/dev/null 2>&1 || true",
             "fi",
-            "unset CMUX_BOOTSTRAP_TTY cmux_relay_cli cmux_relay_tty cmux_relay_report_tty cmux_relay_ports_kick",
+            "unset CMUX_BOOTSTRAP_TTY cmux_relay_cli cmux_relay_tty cmux_relay_telemetry",
         ]
     }
 
@@ -9133,7 +9656,7 @@ struct CMUXCLI {
         if let explicit = optionValue(args, name: "--workspace") { return explicit }
         // When --window is explicitly targeted, don't fall back to env workspace from a different window
         if windowOverride != nil { return nil }
-        return ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
+        return currentProcessEnvironment()["CMUX_WORKSPACE_ID"]
     }
 
     private func forwardSidebarMetadataCommand(
@@ -9923,24 +10446,111 @@ struct CMUXCLI {
     }
 
     private func tmuxWorkspaceItems(client: SocketClient) throws -> [[String: Any]] {
-        let payload = try client.sendV2(method: "workspace.list")
-        return payload["workspaces"] as? [[String: Any]] ?? []
+        let payload = try buildTreePayload(
+            options: TreeCommandOptions(includeAllWindows: true, workspaceHandle: nil, jsonOutput: false),
+            client: client
+        )
+        return tmuxFlattenWorkspaceNodes(from: payload)
+    }
+
+    private func tmuxFlattenWorkspaceNodes(from payload: [String: Any]) -> [[String: Any]] {
+        let windows = payload["windows"] as? [[String: Any]] ?? []
+        return windows.flatMap { $0["workspaces"] as? [[String: Any]] ?? [] }
+    }
+
+    private func tmuxWorkspaceNode(
+        workspaceId: String,
+        client: SocketClient
+    ) throws -> (window: [String: Any], workspace: [String: Any]) {
+        let payload = try buildTreePayload(
+            options: TreeCommandOptions(includeAllWindows: true, workspaceHandle: workspaceId, jsonOutput: false),
+            client: client
+        )
+        let windows = payload["windows"] as? [[String: Any]] ?? []
+        for window in windows {
+            let workspaces = window["workspaces"] as? [[String: Any]] ?? []
+            if let workspace = workspaces.first(where: {
+                ($0["id"] as? String) == workspaceId || ($0["ref"] as? String) == workspaceId
+            }) {
+                return (window, workspace)
+            }
+        }
+        throw CLIError(message: "Workspace target not found")
+    }
+
+    private func tmuxSelectedSurfaceNode(in pane: [String: Any]) -> [String: Any]? {
+        let surfaces = pane["surfaces"] as? [[String: Any]] ?? []
+        if let selected = surfaces.first(where: { ($0["selected"] as? Bool) == true || ($0["selected_in_pane"] as? Bool) == true }) {
+            return selected
+        }
+        return surfaces.first
+    }
+
+    private func tmuxFormatContextFromTree(
+        window: [String: Any],
+        workspace: [String: Any],
+        pane: [String: Any]?,
+        surface: [String: Any]?
+    ) -> [String: String] {
+        let workspaceId = (workspace["id"] as? String) ?? (workspace["ref"] as? String) ?? ""
+        var context: [String: String] = [
+            "session_name": "cmux",
+            "window_id": "@\(workspaceId)",
+            "window_uuid": workspaceId,
+        ]
+
+        if let index = intFromAny(workspace["index"]) {
+            context["window_index"] = String(index)
+        }
+        let windowName = ((workspace["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !windowName.isEmpty {
+            context["window_name"] = windowName
+        }
+
+        if let pane {
+            if let paneUUID = pane["id"] as? String {
+                context["pane_id"] = "%\(paneUUID)"
+                context["pane_uuid"] = paneUUID
+            }
+            if let index = intFromAny(pane["index"]) {
+                context["pane_index"] = String(index)
+            }
+        }
+
+        if let surface {
+            if let surfaceId = surface["id"] as? String {
+                context["surface_id"] = surfaceId
+            }
+            let title = ((surface["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty {
+                context["pane_title"] = title
+                if context["window_name"] == nil {
+                    context["window_name"] = title
+                }
+            }
+        }
+
+        if let windowId = window["id"] as? String, !windowId.isEmpty {
+            context["window_uid"] = windowId
+        }
+        return context
     }
 
     private func tmuxCallerWorkspaceHandle() -> String? {
-        normalizedTmuxTarget(ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"])
+        normalizedTmuxTarget(currentProcessEnvironment()["CMUX_WORKSPACE_ID"])
     }
 
     private func tmuxCallerPaneHandle() -> String? {
-        guard let pane = normalizedTmuxTarget(ProcessInfo.processInfo.environment["TMUX_PANE"])
-            ?? normalizedTmuxTarget(ProcessInfo.processInfo.environment["CMUX_PANE_ID"]) else {
+        let env = currentProcessEnvironment()
+        guard let pane = normalizedTmuxTarget(env["TMUX_PANE"])
+            ?? normalizedTmuxTarget(env["CMUX_PANE_ID"]) else {
             return nil
         }
         return pane.hasPrefix("%") ? String(pane.dropFirst()) : pane
     }
 
     private func tmuxCallerSurfaceHandle() -> String? {
-        normalizedTmuxTarget(ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"])
+        normalizedTmuxTarget(currentProcessEnvironment()["CMUX_SURFACE_ID"])
     }
 
     private func tmuxResolvedCallerWorkspaceId(client: SocketClient) -> String? {
@@ -10243,77 +10853,43 @@ struct CMUXCLI {
         client: SocketClient
     ) throws -> [String: String] {
         let canonicalWorkspaceId = try resolveWorkspaceId(workspaceId, client: client)
-        var context: [String: String] = [
-            "session_name": "cmux",
-            "window_id": "@\(canonicalWorkspaceId)",
-            "window_uuid": canonicalWorkspaceId
-        ]
-
-        let workspaceItems = try tmuxWorkspaceItems(client: client)
-        if let workspace = workspaceItems.first(where: {
-            ($0["id"] as? String) == canonicalWorkspaceId || ($0["ref"] as? String) == workspaceId
-        }) {
-            if let index = intFromAny(workspace["index"]) {
-                context["window_index"] = String(index)
+        let nodes = try tmuxWorkspaceNode(workspaceId: canonicalWorkspaceId, client: client)
+        let panes = nodes.workspace["panes"] as? [[String: Any]] ?? []
+        let resolvedPane: [String: Any]? = {
+            guard let paneId else {
+                return panes.first(where: { ($0["active"] as? Bool) == true || ($0["focused"] as? Bool) == true }) ?? panes.first
             }
-            let title = ((workspace["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !title.isEmpty {
-                context["window_name"] = title
+            return panes.first(where: {
+                ($0["id"] as? String) == paneId || ($0["ref"] as? String) == paneId
+            })
+        }()
+        let resolvedSurface: [String: Any]? = {
+            if let surfaceId {
+                for pane in panes {
+                    let surfaces = pane["surfaces"] as? [[String: Any]] ?? []
+                    if let match = surfaces.first(where: {
+                        ($0["id"] as? String) == surfaceId || ($0["ref"] as? String) == surfaceId
+                    }) {
+                        return match
+                    }
+                }
             }
-        }
-
-        let currentPayload = try client.sendV2(method: "surface.current", params: ["workspace_id": canonicalWorkspaceId])
-        let resolvedPaneId: String? = try {
-            if let paneId {
-                return try tmuxCanonicalPaneId(paneId, workspaceId: canonicalWorkspaceId, client: client)
+            if let resolvedPane {
+                return tmuxSelectedSurfaceNode(in: resolvedPane)
             }
-            if let currentPaneId = currentPayload["pane_id"] as? String {
-                return currentPaneId
-            }
-            if let currentPaneRef = currentPayload["pane_ref"] as? String {
-                return try tmuxCanonicalPaneId(currentPaneRef, workspaceId: canonicalWorkspaceId, client: client)
+            for pane in panes {
+                if let selected = tmuxSelectedSurfaceNode(in: pane) {
+                    return selected
+                }
             }
             return nil
         }()
-        let resolvedSurfaceId: String? = try {
-            if let surfaceId {
-                return try tmuxCanonicalSurfaceId(surfaceId, workspaceId: canonicalWorkspaceId, client: client)
-            }
-            if let resolvedPaneId {
-                return try tmuxSelectedSurfaceId(
-                    workspaceId: canonicalWorkspaceId,
-                    paneId: resolvedPaneId,
-                    client: client
-                )
-            }
-            return currentPayload["surface_id"] as? String
-        }()
-
-        if let resolvedPaneId {
-            context["pane_id"] = "%\(resolvedPaneId)"
-            context["pane_uuid"] = resolvedPaneId
-            let panePayload = try client.sendV2(method: "pane.list", params: ["workspace_id": canonicalWorkspaceId])
-            let panes = panePayload["panes"] as? [[String: Any]] ?? []
-            if let pane = panes.first(where: { ($0["id"] as? String) == resolvedPaneId }),
-               let index = intFromAny(pane["index"]) {
-                context["pane_index"] = String(index)
-            }
-        }
-
-        if let resolvedSurfaceId {
-            context["surface_id"] = resolvedSurfaceId
-            let surfacePayload = try client.sendV2(method: "surface.list", params: ["workspace_id": canonicalWorkspaceId])
-            let surfaces = surfacePayload["surfaces"] as? [[String: Any]] ?? []
-            if let surface = surfaces.first(where: { ($0["id"] as? String) == resolvedSurfaceId }) {
-                let title = ((surface["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !title.isEmpty {
-                    context["pane_title"] = title
-                    context["window_name"] = context["window_name"] ?? title
-                }
-            }
-        }
-
-        return context
+        return tmuxFormatContextFromTree(
+            window: nodes.window,
+            workspace: nodes.workspace,
+            pane: resolvedPane,
+            surface: resolvedSurface
+        )
     }
 
     /// Enrich a tmux format context dictionary with pane geometry data from the
@@ -10717,7 +11293,7 @@ struct CMUXCLI {
         let script = """
         #!/usr/bin/env bash
         set -euo pipefail
-        exec "${CMUX_CLAUDE_TEAMS_CMUX_BIN:-cmux}" __tmux-compat "$@"
+        exec "${CMUX_CLAUDE_TEAMS_CMUX_BIN:-cmux}" __hot-path tmux "$@"
         """
         return try createTmuxCompatShimDirectory(
             directoryName: "claude-teams-bin",
@@ -10832,7 +11408,7 @@ struct CMUXCLI {
         case "${1:-}" in
           -V|-v) echo "tmux 3.4"; exit 0 ;;
         esac
-        exec "${CMUX_OMO_CMUX_BIN:-cmux}" __tmux-compat "$@"
+        exec "${CMUX_OMO_CMUX_BIN:-cmux}" __hot-path tmux "$@"
         """
         let root = try createTmuxCompatShimDirectory(
             directoryName: "omo-bin",
@@ -11362,7 +11938,7 @@ struct CMUXCLI {
         case "${1:-}" in
           -V|-v) echo "tmux 3.4"; exit 0 ;;
         esac
-        exec "${CMUX_OMX_CMUX_BIN:-cmux}" __tmux-compat "$@"
+        exec "${CMUX_OMX_CMUX_BIN:-cmux}" __hot-path tmux "$@"
         """
         return try createTmuxCompatShimDirectory(
             directoryName: "omx-bin",
@@ -11471,7 +12047,7 @@ struct CMUXCLI {
         case "${1:-}" in
           -V|-v) echo "tmux 3.4"; exit 0 ;;
         esac
-        exec "${CMUX_OMC_CMUX_BIN:-cmux}" __tmux-compat "$@"
+        exec "${CMUX_OMC_CMUX_BIN:-cmux}" __hot-path tmux "$@"
         """
         return try createTmuxCompatShimDirectory(
             directoryName: "omc-bin",
@@ -11863,15 +12439,31 @@ struct CMUXCLI {
 
         case "list-windows", "lsw":
             let parsed = try parseTmuxArguments(rawArgs, valueFlags: ["-F", "-t"], boolFlags: [])
-            let items = try tmuxWorkspaceItems(client: client)
-            for item in items {
-                guard let workspaceId = item["id"] as? String else { continue }
-                let context = try tmuxFormatContext(workspaceId: workspaceId, client: client)
-                let fallback = [
-                    context["window_index"] ?? "?",
-                    context["window_name"] ?? workspaceId
-                ].joined(separator: " ")
-                print(tmuxRenderFormat(parsed.value("-F"), context: context, fallback: fallback))
+            let treePayload = try buildTreePayload(
+                options: TreeCommandOptions(includeAllWindows: true, workspaceHandle: nil, jsonOutput: false),
+                client: client
+            )
+            let windows = treePayload["windows"] as? [[String: Any]] ?? []
+            for window in windows {
+                let workspaces = window["workspaces"] as? [[String: Any]] ?? []
+                for workspace in workspaces {
+                    guard let workspaceId = workspace["id"] as? String else { continue }
+                    let pane = (workspace["panes"] as? [[String: Any]] ?? []).first(where: {
+                        ($0["active"] as? Bool) == true || ($0["focused"] as? Bool) == true
+                    })
+                    let surface = pane.flatMap { tmuxSelectedSurfaceNode(in: $0) }
+                    let context = tmuxFormatContextFromTree(
+                        window: window,
+                        workspace: workspace,
+                        pane: pane,
+                        surface: surface
+                    )
+                    let fallback = [
+                        context["window_index"] ?? "?",
+                        context["window_name"] ?? workspaceId
+                    ].joined(separator: " ")
+                    print(tmuxRenderFormat(parsed.value("-F"), context: context, fallback: fallback))
+                }
             }
 
         case "list-panes", "lsp":
@@ -11888,9 +12480,20 @@ struct CMUXCLI {
             let payload = try client.sendV2(method: "pane.list", params: ["workspace_id": workspaceId])
             let panes = payload["panes"] as? [[String: Any]] ?? []
             let containerFrame = payload["container_frame"] as? [String: Any]
+            let nodes = try tmuxWorkspaceNode(workspaceId: workspaceId, client: client)
+            let treePanes = nodes.workspace["panes"] as? [[String: Any]] ?? []
             for pane in panes {
                 guard let paneId = pane["id"] as? String else { continue }
-                var context = try tmuxFormatContext(workspaceId: workspaceId, paneId: paneId, client: client)
+                let treePane = treePanes.first(where: {
+                    ($0["id"] as? String) == paneId || ($0["ref"] as? String) == paneId
+                })
+                let treeSurface = treePane.flatMap { tmuxSelectedSurfaceNode(in: $0) }
+                var context = tmuxFormatContextFromTree(
+                    window: nodes.window,
+                    workspace: nodes.workspace,
+                    pane: treePane,
+                    surface: treeSurface
+                )
                 tmuxEnrichContextWithGeometry(&context, pane: pane, containerFrame: containerFrame)
                 let fallback = context["pane_id"] ?? paneId
                 print(tmuxRenderFormat(parsed.value("-F"), context: context, fallback: fallback))
@@ -12295,8 +12898,9 @@ struct CMUXCLI {
             let (wsArg, rem0) = parseOption(commandArgs, name: "--workspace")
             let (sfArg, rem1) = parseOption(rem0, name: "--surface")
             let (linesArg, rem2) = parseOption(rem1, name: "--lines")
-            let workspaceArg = wsArg ?? (windowOverride == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
-            let surfaceArg = sfArg ?? (wsArg == nil && windowOverride == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let env = currentProcessEnvironment()
+            let workspaceArg = wsArg ?? (windowOverride == nil ? env["CMUX_WORKSPACE_ID"] : nil)
+            let surfaceArg = sfArg ?? (wsArg == nil && windowOverride == nil ? env["CMUX_SURFACE_ID"] : nil)
 
             var params: [String: Any] = [:]
             let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client)
@@ -12666,14 +13270,30 @@ struct CMUXCLI {
         client: SocketClient,
         telemetry: CLISocketSentryTelemetry
     ) throws {
+        let rawInput = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        try runClaudeHook(
+            commandArgs: commandArgs,
+            client: client,
+            telemetry: telemetry,
+            rawInput: rawInput,
+            processEnv: ProcessInfo.processInfo.environment
+        )
+    }
+
+    private func runClaudeHook(
+        commandArgs: [String],
+        client: SocketClient,
+        telemetry: CLISocketSentryTelemetry,
+        rawInput: String,
+        processEnv: [String: String]
+    ) throws {
         let subcommand = commandArgs.first?.lowercased() ?? "help"
         let hookArgs = Array(commandArgs.dropFirst())
         let hookWsFlag = optionValue(hookArgs, name: "--workspace")
-        let workspaceArg = hookWsFlag ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"]
-        let surfaceArg = optionValue(hookArgs, name: "--surface") ?? (hookWsFlag == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
-        let rawInput = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let workspaceArg = hookWsFlag ?? processEnv["CMUX_WORKSPACE_ID"]
+        let surfaceArg = optionValue(hookArgs, name: "--surface") ?? (hookWsFlag == nil ? processEnv["CMUX_SURFACE_ID"] : nil)
         let parsedInput = parseClaudeHookInput(rawInput: rawInput)
-        let sessionStore = ClaudeHookSessionStore()
+        let sessionStore = ClaudeHookSessionStore(processEnv: processEnv)
         telemetry.breadcrumb(
             "claude-hook.input",
             data: [
@@ -12699,7 +13319,7 @@ struct CMUXCLI {
                 client: client
             )
             let claudePid: Int? = {
-                guard let raw = ProcessInfo.processInfo.environment["CMUX_CLAUDE_PID"]?
+                guard let raw = processEnv["CMUX_CLAUDE_PID"]?
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                     let pid = Int(raw),
                     pid > 0 else {
@@ -12708,7 +13328,7 @@ struct CMUXCLI {
                 return pid
             }()
             let launchCommand = agentLaunchCommandFromEnvironment(
-                ProcessInfo.processInfo.environment,
+                processEnv,
                 fallbackPID: claudePid,
                 fallbackKind: "claude",
                 cwd: parsedInput.cwd
@@ -14219,12 +14839,12 @@ struct CMUXCLI {
     private static func isClaudeHookSettingsOption(_ args: [String], index: Int) -> Bool {
         let arg = args[index]
         if arg.hasPrefix("--settings=") {
-            return arg.contains("claude-hook")
+            return arg.contains("claude-hook") || arg.contains("__hot-path hook claude")
         }
         guard arg == "--settings", index + 1 < args.count else {
             return false
         }
-        return args[index + 1].contains("claude-hook")
+        return args[index + 1].contains("claude-hook") || args[index + 1].contains("__hot-path hook claude")
     }
 
     private static let claudeLaunchValueOptions: Set<String> = [
@@ -14503,7 +15123,7 @@ struct CMUXCLI {
             name: "codex", displayName: "Codex", statusKey: "codex",
             configDir: ".codex", configFile: "hooks.json", configDirEnvOverride: "CODEX_HOME",
             sessionStoreSuffix: "codex", disableEnvVar: "CMUX_CODEX_HOOKS_DISABLED",
-            hookMarker: "cmux codex-hook", format: .nested(timeoutMs: 5000),
+            hookMarker: "cmux __hot-path hook codex", format: .nested(timeoutMs: 5000),
             events: [
                 .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
                 .init(agentEvent: "UserPromptSubmit", cmuxSubcommand: "prompt-submit"),
@@ -14515,14 +15135,14 @@ struct CMUXCLI {
             name: "opencode", displayName: "OpenCode", statusKey: "opencode",
             configDir: ".config/opencode", configFile: "plugins/cmux-session.js", configDirEnvOverride: "OPENCODE_CONFIG_DIR",
             sessionStoreSuffix: "opencode", disableEnvVar: "CMUX_OPENCODE_HOOKS_DISABLED",
-            hookMarker: "cmux opencode-hook", format: .flat,
+            hookMarker: "cmux __hot-path hook opencode", format: .flat,
             events: []
         ),
         AgentHookDef(
             name: "cursor", displayName: "Cursor", statusKey: "cursor",
             configDir: ".cursor", configFile: "hooks.json",
             sessionStoreSuffix: "cursor", disableEnvVar: "CMUX_CURSOR_HOOKS_DISABLED",
-            hookMarker: "cmux cursor-hook", format: .flat,
+            hookMarker: "cmux __hot-path hook cursor", format: .flat,
             events: [
                 .init(agentEvent: "beforeSubmitPrompt", cmuxSubcommand: "prompt-submit"),
                 .init(agentEvent: "stop", cmuxSubcommand: "stop"),
@@ -14535,7 +15155,7 @@ struct CMUXCLI {
             name: "gemini", displayName: "Gemini", statusKey: "gemini",
             configDir: ".gemini", configFile: "settings.json",
             sessionStoreSuffix: "gemini", disableEnvVar: "CMUX_GEMINI_HOOKS_DISABLED",
-            hookMarker: "cmux gemini-hook", format: .nested(timeoutMs: 10000),
+            hookMarker: "cmux __hot-path hook gemini", format: .nested(timeoutMs: 10000),
             events: [
                 .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
                 .init(agentEvent: "BeforeAgent", cmuxSubcommand: "prompt-submit"),
@@ -14547,7 +15167,7 @@ struct CMUXCLI {
             name: "copilot", displayName: "Copilot", statusKey: "copilot",
             configDir: ".copilot", configFile: "config.json",
             sessionStoreSuffix: "copilot", disableEnvVar: "CMUX_COPILOT_HOOKS_DISABLED",
-            hookMarker: "cmux copilot-hook", format: .nested(timeoutMs: 5000),
+            hookMarker: "cmux __hot-path hook copilot", format: .nested(timeoutMs: 5000),
             events: [
                 .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
                 .init(agentEvent: "Stop", cmuxSubcommand: "stop"),
@@ -14559,7 +15179,7 @@ struct CMUXCLI {
             name: "codebuddy", displayName: "CodeBuddy", statusKey: "codebuddy",
             configDir: ".codebuddy", configFile: "settings.json",
             sessionStoreSuffix: "codebuddy", disableEnvVar: "CMUX_CODEBUDDY_HOOKS_DISABLED",
-            hookMarker: "cmux codebuddy-hook", format: .nested(timeoutMs: 5000),
+            hookMarker: "cmux __hot-path hook codebuddy", format: .nested(timeoutMs: 5000),
             events: [
                 .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
                 .init(agentEvent: "Stop", cmuxSubcommand: "stop"),
@@ -14571,7 +15191,7 @@ struct CMUXCLI {
             name: "factory", displayName: "Factory", statusKey: "factory",
             configDir: ".factory", configFile: "settings.json",
             sessionStoreSuffix: "factory", disableEnvVar: "CMUX_FACTORY_HOOKS_DISABLED",
-            hookMarker: "cmux factory-hook", format: .nested(timeoutMs: 5000),
+            hookMarker: "cmux __hot-path hook factory", format: .nested(timeoutMs: 5000),
             events: [
                 .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
                 .init(agentEvent: "Stop", cmuxSubcommand: "stop"),
@@ -14583,7 +15203,7 @@ struct CMUXCLI {
             name: "qoder", displayName: "Qoder", statusKey: "qoder",
             configDir: ".qoder", configFile: "settings.json",
             sessionStoreSuffix: "qoder", disableEnvVar: "CMUX_QODER_HOOKS_DISABLED",
-            hookMarker: "cmux qoder-hook", format: .nested(timeoutMs: 5000),
+            hookMarker: "cmux __hot-path hook qoder", format: .nested(timeoutMs: 5000),
             events: [
                 .init(agentEvent: "SessionStart", cmuxSubcommand: "session-start"),
                 .init(agentEvent: "Stop", cmuxSubcommand: "stop"),
@@ -14599,7 +15219,7 @@ struct CMUXCLI {
     // MARK: Generic hook install/uninstall
 
     private func hookCommand(for def: AgentHookDef, event: AgentHookDef.HookEvent) -> String {
-        "[ -n \"$CMUX_SURFACE_ID\" ] && [ \"$\(def.disableEnvVar)\" != \"1\" ] && command -v cmux >/dev/null 2>&1 && cmux \(def.name)-hook \(event.cmuxSubcommand) || echo '{}'"
+        "[ -n \"$CMUX_SURFACE_ID\" ] && [ \"$\(def.disableEnvVar)\" != \"1\" ] && command -v cmux >/dev/null 2>&1 && cmux __hot-path hook \(def.name) \(event.cmuxSubcommand) || echo '{}'"
     }
 
     private func buildHooksDict(for def: AgentHookDef) -> [String: Any] {
@@ -14753,7 +15373,7 @@ function sendHook(subcommand, ctx, event, extra = {}) {
   };
   const cmux = process.env.CMUX_OPENCODE_CMUX_BIN || "cmux";
   try {
-    spawnSync(cmux, ["opencode-hook", subcommand], {
+    spawnSync(cmux, ["__hot-path", "hook", "opencode", subcommand], {
       input: JSON.stringify(payload),
       encoding: "utf8",
       env: hookEnvironment(cwd),
@@ -15100,7 +15720,25 @@ export default CMUXSessionRestore;
     // MARK: Generic hook handler
 
     private func runGenericAgentHook(def: AgentHookDef, commandArgs: [String], client: SocketClient, telemetry: CLISocketSentryTelemetry) throws {
-        let env = ProcessInfo.processInfo.environment
+        let rawInput = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        try runGenericAgentHook(
+            def: def,
+            commandArgs: commandArgs,
+            client: client,
+            telemetry: telemetry,
+            rawInput: rawInput,
+            processEnv: ProcessInfo.processInfo.environment
+        )
+    }
+
+    private func runGenericAgentHook(
+        def: AgentHookDef,
+        commandArgs: [String],
+        client: SocketClient,
+        telemetry: CLISocketSentryTelemetry,
+        rawInput: String,
+        processEnv env: [String: String]
+    ) throws {
         let subcommand = commandArgs.first?.lowercased() ?? ""
         let hookArgs = Array(commandArgs.dropFirst())
         telemetry.breadcrumb("\(def.name)-hook.\(subcommand)")
@@ -15110,7 +15748,6 @@ export default CMUXSessionRestore;
         let workspaceArg = hookWsFlag ?? env["CMUX_WORKSPACE_ID"]
         let surfaceArg = optionValue(hookArgs, name: "--surface") ?? (hookWsFlag == nil ? env["CMUX_SURFACE_ID"] : nil)
 
-        let rawInput = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let input = parseClaudeHookInput(rawInput: rawInput)
 
         let store = ClaudeHookSessionStore(

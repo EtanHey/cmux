@@ -2186,6 +2186,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceReportTTY(params: params))
         case "surface.ports_kick":
             return v2Result(id: id, self.v2SurfacePortsKick(params: params))
+        case "surface.telemetry":
+            return v2Result(id: id, self.v2SurfaceTelemetry(params: params))
         case "surface.clear_history":
             return v2Result(id: id, self.v2SurfaceClearHistory(params: params))
         case "surface.trigger_flash":
@@ -2535,6 +2537,7 @@ class TerminalController {
             "surface.send_key",
             "surface.report_tty",
             "surface.ports_kick",
+            "surface.telemetry",
             "surface.read_text",
             "surface.clear_history",
             "surface.trigger_flash",
@@ -4265,6 +4268,79 @@ class TerminalController {
         }
 
         return result
+    }
+
+    private func v2SurfaceTelemetry(params: [String: Any]) -> V2CallResult {
+        guard let workspaceId = v2UUID(params, "workspace_id") else {
+            return .err(code: "invalid_params", message: "Missing or invalid workspace_id", data: nil)
+        }
+
+        let requestedSurfaceId = v2UUID(params, "surface_id")
+        if v2HasNonNullParam(params, "surface_id"), requestedSurfaceId == nil {
+            return .err(code: "invalid_params", message: "Missing or invalid surface_id", data: nil)
+        }
+
+        let ttyName: String? = {
+            guard let raw = v2RawString(params, "tty_name")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else {
+                return nil
+            }
+            return raw
+        }()
+
+        let reason: WorkspaceRemoteSessionController.PortScanKickReason? = {
+            guard let rawReason = v2RawString(params, "reason") else {
+                return nil
+            }
+            return Self.parseRemotePortScanKickReason(rawReason)
+        }()
+
+        if params["reason"] != nil, reason == nil {
+            return .err(code: "invalid_params", message: "reason must be command or refresh", data: nil)
+        }
+
+        guard ttyName != nil || reason != nil else {
+            return .err(
+                code: "invalid_params",
+                message: "surface.telemetry requires tty_name and/or reason",
+                data: nil
+            )
+        }
+
+        let surfaceIDString = requestedSurfaceId?.uuidString
+        DispatchQueue.main.async {
+            if let ttyName {
+                var reportParams: [String: Any] = [
+                    "workspace_id": workspaceId.uuidString,
+                    "tty_name": ttyName,
+                ]
+                if let surfaceIDString {
+                    reportParams["surface_id"] = surfaceIDString
+                }
+                _ = self.v2SurfaceReportTTY(params: reportParams)
+            }
+
+            if let reason {
+                var kickParams: [String: Any] = [
+                    "workspace_id": workspaceId.uuidString,
+                    "reason": reason.rawValue,
+                ]
+                if let surfaceIDString {
+                    kickParams["surface_id"] = surfaceIDString
+                }
+                _ = self.v2SurfacePortsKick(params: kickParams)
+            }
+        }
+
+        return .ok([
+            "workspace_id": workspaceId.uuidString,
+            "workspace_ref": v2Ref(kind: .workspace, uuid: workspaceId),
+            "surface_id": v2OrNull(surfaceIDString),
+            "surface_ref": v2Ref(kind: .surface, uuid: requestedSurfaceId),
+            "tty_name": v2OrNull(ttyName),
+            "reason": v2OrNull(reason?.rawValue),
+            "queued": true,
+        ])
     }
 
     private func v2SurfacePortsKick(params: [String: Any]) -> V2CallResult {

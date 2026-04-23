@@ -131,13 +131,21 @@ _cmux_ports_kick_via_relay() {
     local reason="${1:-command}"
     _cmux_socket_uses_remote_relay || return 1
     local workspace_id=""
+    local relay_cli=""
+    local tty_name_json=""
     workspace_id="$(_cmux_relay_workspace_id)" || return 1
+    relay_cli="$(_cmux_relay_cli_path)" || return 1
     local params="{\"workspace_id\":\"$workspace_id\",\"reason\":\"$reason\""
     if [[ -n "$CMUX_PANEL_ID" ]]; then
         params+=",\"surface_id\":\"$CMUX_PANEL_ID\""
     fi
+    if [[ -n "$_CMUX_TTY_NAME" && "$_CMUX_TTY_REPORTED" != "1" ]]; then
+        tty_name_json="$(_cmux_json_escape "$_CMUX_TTY_NAME")"
+        params+=",\"tty_name\":\"$tty_name_json\""
+    fi
     params+="}"
-    _cmux_relay_rpc_bg "surface.ports_kick" "$params"
+    { "$relay_cli" __hot-path rpc surface.telemetry "$params" >/dev/null 2>&1 || true } >/dev/null 2>&1 &!
+    [[ -n "$_CMUX_TTY_NAME" ]] && _CMUX_TTY_REPORTED=1
 }
 
 _cmux_restore_scrollback_once() {
@@ -1090,7 +1098,9 @@ _cmux_preexec() {
     esac
 
     # Register TTY + kick batched port scan for foreground commands (servers).
-    _cmux_report_tty_once
+    if _cmux_socket_is_unix; then
+        _cmux_report_tty_once
+    fi
     _cmux_ports_kick command
     _cmux_halt_pr_poll_loop
     _cmux_stop_git_head_watch

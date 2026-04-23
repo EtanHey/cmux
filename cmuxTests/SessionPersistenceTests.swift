@@ -1538,7 +1538,7 @@ final class SocketListenerAcceptPolicyTests: XCTestCase {
                     "--permission-mode",
                     "auto",
                     "--settings",
-                    #"{"hooks":{"SessionStart":[{"hooks":[{"command":"cmux claude-hook session-start"}]}]}}"#,
+                    #"{"hooks":{"SessionStart":[{"hooks":[{"command":"cmux __hot-path hook claude session-start"}]}]}}"#,
                     "--session-id",
                     "old-session",
                     "initial prompt should not replay"
