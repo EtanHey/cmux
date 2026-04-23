@@ -1683,10 +1683,11 @@ struct CMUXCLI {
     private static let hotPathRequestMaxBytes = 1_048_576
 
     private func currentProcessEnvironment() -> [String: String] {
+        let environment = ProcessInfo.processInfo.environment
         if let override = Thread.current.threadDictionary[Self.hotPathEnvironmentThreadKey] as? [String: String] {
-            return override
+            return environment.merging(override, uniquingKeysWith: { _, new in new })
         }
-        return ProcessInfo.processInfo.environment
+        return environment
     }
 
     private func withHotPathEnvironment<T>(
