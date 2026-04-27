@@ -14,6 +14,7 @@ EXECUTABLE_PATH="${CMUX_LEAK_EXECUTABLE_PATH:-${CMUX_RAPID_SPAWN_KILL_EXECUTABLE
 TMP_ROOT="${CMUX_LEAK_TMPDIR:-${TMPDIR:-/tmp}/cmux-iosurface-leak.$$}"
 KEEP_OUTPUT="${CMUX_LEAK_KEEP_OUTPUT:-0}"
 REQUIRE_IOSURFACE="${CMUX_LEAK_REQUIRE_IOSURFACE:-0}"
+SENTINEL_PID=""
 
 log() {
   printf '[iosurface-leak] %s\n' "$*"
@@ -158,6 +159,9 @@ terminate_pid() {
 
 cleanup() {
   local status="$1"
+  if [[ -n "$SENTINEL_PID" ]]; then
+    terminate_pid "$SENTINEL_PID"
+  fi
   if [[ "$status" -eq 0 && "$KEEP_OUTPUT" != "1" ]]; then
     rm -rf "$TMP_ROOT"
   else
@@ -183,7 +187,7 @@ main() {
   executable="$(resolve_executable)"
 
   mkdir -p "$TMP_ROOT"
-  trap 'status=$?; if [[ -n "${pid:-}" ]]; then terminate_pid "$pid"; fi; cleanup "$status"' EXIT
+  trap 'cleanup $?' EXIT
 
   fixture_leaks_output="$TMP_ROOT/rapid_spawn_kill.leaks.out"
   log "running rapid_spawn_kill.sh under leaks --atExit iterations=$ITERATIONS"
@@ -215,6 +219,7 @@ main() {
   CMUX_RAPID_SPAWN_KILL_FORCE_WINDOW=1 \
     "$executable" >"$TMP_ROOT/sentinel.log" 2>&1 &
   pid="$!"
+  SENTINEL_PID="$pid"
 
   wait_for_iosurface_or_timeout "$pid" || die "cmux sentinel exited before leaks sampling"
 
