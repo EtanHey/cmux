@@ -50,6 +50,16 @@ zig build -Demit-xcframework=true -Doptimize=ReleaseFast
 
 ## Running Tests
 
+### Pre-push regression gate
+
+Enable the local regression harness hook before pushing:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This enables `.githooks/pre-push`, which runs `scripts/run_tests.sh` and blocks pushes on regression failures. Do not bypass it with `--no-verify`; fix the failing regression instead.
+
 ### Basic tests (run on VM)
 
 ```bash

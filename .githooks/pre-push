@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-push hook - regression harness gate
+# DO NOT BYPASS with --no-verify. DO NOT SILENCE failures.
+# Failures are regression signals; reproduce and fix them before pushing.
+
+set -u
+set -o pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root" || exit 1
+
+if [ ! -x scripts/run_tests.sh ]; then
+  printf 'WARNING: no executable scripts/run_tests.sh; skipping regression harness\n' >&2
+  exit 0
+fi
+
+bash scripts/run_tests.sh
+exit_status=$?
+
+if [ "$exit_status" -ne 0 ]; then
+  cat >&2 <<'BANNER'
+
+PUSH BLOCKED - regression harness failed.
+Read the failure, reproduce it, and fix the bug.
+DO NOT bypass with --no-verify or silence this hook.
+
+BANNER
+  exit "$exit_status"
+fi
