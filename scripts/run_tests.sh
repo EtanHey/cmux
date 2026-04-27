@@ -12,10 +12,13 @@ SCHEME="${CMUX_RUN_TESTS_SCHEME:-cmux-unit}"
 CONFIGURATION="${CMUX_RUN_TESTS_CONFIGURATION:-Debug}"
 DESTINATION="${CMUX_RUN_TESTS_DESTINATION:-platform=macOS,arch=arm64}"
 DERIVED_DATA_PATH="${CMUX_RUN_TESTS_DERIVED_DATA_PATH:-/tmp/cmux-run-tests-derived}"
+BUILT_APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/cmux DEV.app"
 FIXTURE_PATH="$REPO_ROOT/tests/fixtures/rapid_spawn_kill.sh"
+LEAK_TEST_PATH="$REPO_ROOT/tests/regression/test_iosurface_leak.sh"
 IOSURFACE_LIMIT_MB="${CMUX_RAPID_SPAWN_KILL_IOSURFACE_LIMIT_MB:-50}"
 XCTEST_ITERATIONS="${CMUX_RUN_TESTS_XCTEST_ITERATIONS:-3}"
 READY_TIMEOUT_MS="${CMUX_RAPID_SPAWN_KILL_READY_TIMEOUT_MS:-8000}"
+LEAK_TEST_ITERATIONS="${CMUX_RUN_TESTS_LEAK_ITERATIONS:-3}"
 ZIG_015_BIN="${CMUX_RUN_TESTS_ZIG_BIN:-/opt/homebrew/opt/zig@0.15/bin}"
 
 if [ -d "$ZIG_015_BIN" ]; then
@@ -51,6 +54,16 @@ run_xcodebuild_fixture_test() {
   return $?
 }
 
+run_iosurface_leak_test() {
+  log "Running Apple leaks CLI IOSurface regression test"
+  CMUX_LEAK_THRESHOLD_MB="$IOSURFACE_LIMIT_MB" \
+  CMUX_LEAK_TEST_ITERATIONS="$LEAK_TEST_ITERATIONS" \
+  CMUX_LEAK_READY_TIMEOUT_MS="$READY_TIMEOUT_MS" \
+  CMUX_LEAK_APP_PATH="$BUILT_APP_PATH" \
+    "$LEAK_TEST_PATH"
+  return $?
+}
+
 cd "$REPO_ROOT" || {
   mark_failure 1 "cd-repo-root"
   exit "$EXIT_STATUS"
@@ -59,6 +72,9 @@ cd "$REPO_ROOT" || {
 if [ ! -x "$FIXTURE_PATH" ]; then
   log "Missing executable fixture: $FIXTURE_PATH"
   mark_failure 1 "fixture-present"
+elif [ ! -x "$LEAK_TEST_PATH" ]; then
+  log "Missing executable regression test: $LEAK_TEST_PATH"
+  mark_failure 1 "iosurface-leak-test-present"
 else
   if [ ! -d "$REPO_ROOT/GhosttyKit.xcframework" ]; then
     log "GhosttyKit.xcframework missing; initializing submodules and downloading prebuilt framework"
@@ -73,6 +89,12 @@ else
   xcodebuild_status=$?
   if [ "$xcodebuild_status" -ne 0 ]; then
     mark_failure 4 "xcodebuild-rapid-spawn-kill"
+  fi
+
+  run_iosurface_leak_test
+  leak_test_status=$?
+  if [ "$leak_test_status" -ne 0 ]; then
+    mark_failure 8 "leaks-iosurface-regression"
   fi
 fi
 
