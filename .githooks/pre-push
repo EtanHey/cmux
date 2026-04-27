@@ -27,3 +27,5 @@ DO NOT bypass with --no-verify or silence this hook.
 BANNER
   exit "$exit_status"
 fi
+
+exit 0
