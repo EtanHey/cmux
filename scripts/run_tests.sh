@@ -62,8 +62,9 @@ if [ ! -x "$FIXTURE_PATH" ]; then
 else
   if [ ! -d "$REPO_ROOT/GhosttyKit.xcframework" ]; then
     log "GhosttyKit.xcframework missing; initializing submodules and downloading prebuilt framework"
-    git submodule update --init --recursive ghostty vendor/bonsplit
-    if ! "$REPO_ROOT/scripts/download-prebuilt-ghosttykit.sh"; then
+    if ! git submodule update --init --recursive ghostty vendor/bonsplit; then
+      mark_failure 2 "submodule-init"
+    elif ! "$REPO_ROOT/scripts/download-prebuilt-ghosttykit.sh"; then
       mark_failure 2 "ghosttykit-download"
     fi
   fi
