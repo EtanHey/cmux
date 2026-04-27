@@ -125,16 +125,19 @@ parse_fixture_iosurface_mb() {
 
 wait_for_iosurface_or_timeout() {
   local pid="$1"
-  local deadline
+  local deadline iosurface_bytes
   deadline=$((SECONDS + (READY_TIMEOUT_MS / 1000) + 1))
   while kill -0 "$pid" 2>/dev/null; do
-    if [[ "$(iosurface_bytes_for_pid "$pid")" != "0" ]]; then
+    iosurface_bytes="$(iosurface_bytes_for_pid "$pid")"
+    if (( iosurface_bytes > 0 )); then
       return 0
     fi
+    # Timeout is non-fatal: direct shell runs can report 0 MB while the XCTest
+    # host still records positive IOSurface allocation from the same fixture.
     if [[ "$SECONDS" -ge "$deadline" ]]; then
       return 0
     fi
-    sleep 0.1
+    sleep 0.2
   done
   return 1
 }
